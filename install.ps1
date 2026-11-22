@@ -121,7 +121,7 @@ if (-not $SkipClaudeConfig) {
 }
 
 Head "Done"
-Info "1. Start SketchUp and open your model. Ruby Console should show 'SketchUp MCP Server started'."
-Info "   (Plugins > MCP Server has Start/Stop/Restart and 'Show Token File'.)"
+Info "1. Start SketchUp and open your model. Ruby Console (Extensions > Developer > Ruby Console) should show 'Server running'."
+Info "   (Extensions > MCP Server has Start/Stop/Restart and 'Show Token File'.)"
 Info "2. Fully quit Claude Desktop (tray icon > Quit) and reopen it."
 Info "3. In Claude, ask: 'Give me a model_summary of the SketchUp model.'"

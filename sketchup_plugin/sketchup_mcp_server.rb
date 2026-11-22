@@ -1298,7 +1298,7 @@ module SU_MCP
       token # make sure the token file exists before any client connects
       UI.messagebox("SketchUp MCP Server started on port #{PORT}") if show_message
       log "[SU_MCP] Server running on http://localhost:#{PORT}"
-      log "[SU_MCP] Logging to Ruby Console (Window → Ruby Console)"
+      log "[SU_MCP] Logging to Ruby Console (Extensions → Developer → Ruby Console (older SketchUp: Window → Ruby Console))"
 
     rescue Errno::EADDRINUSE
       error_msg = "Port #{PORT} is already in use. Another instance may be running.\n\n" \

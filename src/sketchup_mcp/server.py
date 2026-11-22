@@ -70,7 +70,7 @@ async def su_get(path: str, params: dict | None = None) -> dict:
         except httpx.ConnectError:
             raise RuntimeError(
                 "Cannot connect to SketchUp. Make sure SketchUp is running "
-                "and the MCP plugin is loaded (Plugins → MCP Server → Start Server)."
+                "and the MCP plugin is loaded (Extensions → MCP Server → Start Server)."
             )
         except httpx.TimeoutException:
             raise RuntimeError(
@@ -103,7 +103,7 @@ async def su_post(path: str, body: dict | None = None) -> dict:
         except httpx.ConnectError:
             raise RuntimeError(
                 "Cannot connect to SketchUp. Make sure SketchUp is running "
-                "and the MCP plugin is loaded (Plugins → MCP Server → Start Server)."
+                "and the MCP plugin is loaded (Extensions → MCP Server → Start Server)."
             )
         except httpx.TimeoutException:
             raise RuntimeError(

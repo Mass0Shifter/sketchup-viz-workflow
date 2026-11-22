@@ -55,7 +55,7 @@ The original geometry, transform and component tools are still there, plus `exec
 - **Token.** On first start the plugin writes a random token to `%APPDATA%\SketchUpMCP\token`. Every request must send it, so websites in your browser and programs that can't read your profile can't drive SketchUp through the port. Delete the file and restart SketchUp to rotate it.
 - **Loopback only.** The plugin listens on `127.0.0.1` and rejects requests whose `Host` isn't local. The upstream `Access-Control-Allow-Origin: *` header is gone.
 - **Undo.** Every `execute_ruby` call is a single SketchUp operation: one Ctrl+Z undoes it, and it's rolled back automatically if the code raises.
-- `execute_ruby` can still do anything SketchUp's Ruby can. Use **Plugins > MCP Server > Stop Server** when you're not using it.
+- `execute_ruby` can still do anything SketchUp's Ruby can. Use **Extensions > MCP Server > Stop Server** when you're not using it.
 
 ## Configuration
 
@@ -146,9 +146,9 @@ cp sketchup_plugin/lib/construction/roof_truss.rb "$PLUGINS/lib/construction/"
 Restart SketchUp. The server **auto-starts on port 8080** when SketchUp loads.
 
 You can also use:
-- **Plugins → MCP Server → Start Server**
-- **Plugins → MCP Server → Stop Server**
-- **Plugins → MCP Server → Restart Server**
+- **Extensions → MCP Server → Start Server**
+- **Extensions → MCP Server → Stop Server**
+- **Extensions → MCP Server → Restart Server**
 
 #### Verify
 

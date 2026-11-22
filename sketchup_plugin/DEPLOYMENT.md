@@ -38,7 +38,7 @@ If you prefer to deploy manually:
 
 After deployment:
 1. Open SketchUp
-2. Open Ruby Console (Window → Ruby Console)
+2. Open Ruby Console (Extensions → Developer → Ruby Console (older SketchUp: Window → Ruby Console))
 3. Look for these messages:
    - `====== LOADING SKETCHUP MCP PLUGIN ======`
    - `====== REQUIRES COMPLETE ======`
