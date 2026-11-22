@@ -1,0 +1,1370 @@
+# sketchup_mcp_server.rb
+# SketchUp MCP Bridge Plugin
+# Installs a local HTTP server inside SketchUp that the Python MCP server talks to.
+#
+# Installation: Copy this file into your SketchUp Plugins directory.
+#   macOS: ~/Library/Application Support/SketchUp <version>/SketchUp/Plugins/
+#   Windows: %APPDATA%\SketchUp\SketchUp <version>\SketchUp\Plugins\
+#
+# After copying, restart SketchUp. The server will auto-start on port 8080.
+
+puts "====== LOADING SKETCHUP MCP PLUGIN ======"
+
+require 'socket'
+require 'json'
+require 'sketchup'
+require 'uri'
+require 'cgi'
+require 'thread'
+require 'stringio'
+
+puts "====== REQUIRES COMPLETE ======"
+
+# Load construction modules (optional — they only matter if you use the
+# framing/Medeek tools; a failure here must not stop the inspection server)
+begin
+  require_relative 'sketchup_mcp/construction'
+  puts "====== CONSTRUCTION MODULES LOADED ======"
+rescue LoadError, StandardError => e
+  puts "[SU_MCP] Construction modules not loaded: #{e.message}"
+end
+
+require 'securerandom'
+require 'fileutils'
+require_relative 'sketchup_mcp/inspect'
+
+module SU_MCP
+  PORT = (ENV['SU_MCP_PORT'] || 8080).to_i
+  REQUEST_TIMEOUT = (ENV['SU_MCP_TIMEOUT'] || 120).to_i
+
+  # Shared-secret token. Both the plugin and the Python MCP server read this
+  # file; every HTTP request must carry it in the X-SU-MCP-Token header.
+  # This stops web pages in your browser (and other local programs that don't
+  # have the file) from driving SketchUp through the open port.
+  TOKEN_FILE = File.join(ENV['APPDATA'] || ENV['XDG_CONFIG_HOME'] || File.join(Dir.home, '.config'),
+                         'SketchUpMCP', 'token')
+
+  def self.token
+    @token ||= begin
+      if File.exist?(TOKEN_FILE) && !File.read(TOKEN_FILE).strip.empty?
+        File.read(TOKEN_FILE).strip
+      else
+        FileUtils.mkdir_p(File.dirname(TOKEN_FILE))
+        t = SecureRandom.hex(24)
+        File.write(TOKEN_FILE, t)
+        t
+      end
+    end
+  end
+
+  # Constants
+  ORIGIN = Geom::Point3d.new(0, 0, 0)
+  X_AXIS = Geom::Vector3d.new(1, 0, 0)
+  Y_AXIS = Geom::Vector3d.new(0, 1, 0)
+  Z_AXIS = Geom::Vector3d.new(0, 0, 1)
+
+  # Thread-safe request queue for main thread execution
+  @request_queue = []
+  @queue_mutex = Mutex.new
+  @queue_cv = ConditionVariable.new
+  @timer_id = nil
+  @last_request_timing = {}
+
+  # Logging to console for debugging (file logging disabled for performance)
+  def self.log(message)
+    timestamp = Time.now.strftime("%Y-%m-%d %H:%M:%S.%L")
+    log_line = "[#{timestamp}] #{message}"
+    puts log_line
+  end
+
+  # ---------------------------------------------------------------------------
+  # Helpers
+  # ---------------------------------------------------------------------------
+
+  def self.model
+    Sketchup.active_model
+  end
+
+  def self.entities
+    model.entities
+  end
+
+  def self.send_json_response(data, status = 200)
+    json = JSON.generate(data)
+    status_text = status == 200 ? "OK" : (status == 404 ? "Not Found" : "Error")
+
+    response = "HTTP/1.1 #{status} #{status_text}\r\n"
+    response += "Content-Type: application/json\r\n"
+    response += "Content-Length: #{json.bytesize}\r\n"
+    response += "Connection: close\r\n"
+    response += "\r\n"
+    response += json
+    response
+  end
+
+  def self.send_error_response(message, status = 400)
+    send_json_response({ error: message }, status)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Tool handlers — each returns a plain Ruby object (will be JSON-encoded)
+  # ---------------------------------------------------------------------------
+
+  # --- Query ---
+
+  def self.handle_get_model_info(params = {})
+    m = model
+    {
+      name:         m.title,
+      description:  m.description,
+      path:         m.path,
+      modified:     m.modified?,
+      unit:         m.options['UnitsOptions']['LengthUnit'],
+      entity_count: m.entities.count,
+      layer_count:  m.layers.count,
+      material_count: m.materials.count
+    }
+  end
+
+  def self.handle_list_layers(params = {})
+    model.layers.map { |l| { name: l.name, visible: l.visible? } }
+  end
+
+  def self.handle_list_materials(params = {})
+    model.materials.map do |mat|
+      color = mat.color
+      {
+        name:  mat.name,
+        color: { r: color.red, g: color.green, b: color.blue, a: color.alpha },
+        texture: mat.texture ? mat.texture.filename : nil
+      }
+    end
+  end
+
+  def self.handle_list_entities(params = {})
+    ents = params['group_name'] ? find_group(params['group_name'])&.entities : model.entities
+    raise "Group not found: #{params['group_name']}" unless ents
+
+    ents.map do |e|
+      base = { id: e.entityID, type: e.class.name }
+      case e
+      when Sketchup::Group
+        base.merge!(name: e.name, layer: e.layer.name)
+      when Sketchup::ComponentInstance
+        base.merge!(name: e.definition.name, layer: e.layer.name)
+      when Sketchup::Face
+        base.merge!(area: e.area, layer: e.layer.name, normal: vec3(e.normal))
+      when Sketchup::Edge
+        base.merge!(length: e.length, layer: e.layer.name)
+      end
+      base
+    end
+  end
+
+  def self.handle_list_components(params = {})
+    model.definitions.map do |defn|
+      {
+        name:        defn.name,
+        description: defn.description,
+        path:        defn.path,
+        instance_count: defn.instances.count,
+        entity_count:   defn.entities.count
+      }
+    end
+  end
+
+  # --- Create geometry ---
+
+  def self.handle_create_face(params = {})
+    pts = parse_points(params['points'])
+    raise "Need at least 3 points" if pts.length < 3
+    model.start_operation('MCP Create Face', true)
+    face = entities.add_face(pts)
+    apply_layer(face, params['layer'])
+    apply_material(face, params['material'])
+    model.commit_operation
+    { id: face.entityID, type: 'Face', area: face.area, normal: vec3(face.normal) }
+  end
+
+  def self.handle_create_edge(params = {})
+    pt1 = parse_point(params['start'])
+    pt2 = parse_point(params['end'])
+    model.start_operation('MCP Create Edge', true)
+    edge = entities.add_line(pt1, pt2)
+    apply_layer(edge, params['layer'])
+    model.commit_operation
+    { id: edge.entityID, type: 'Edge', length: edge.length }
+  end
+
+  def self.handle_create_group(params = {})
+    model.start_operation('MCP Create Group', true)
+
+    group = nil
+    if params['entities']
+      ids = params['entities'].map(&:to_i)
+      ents_to_add = entities.select { |e| ids.include?(e.entityID) }
+      raise "No matching entities found to group" if ents_to_add.empty?
+      group = entities.add_group(ents_to_add)
+    else
+      group = entities.add_group
+    end
+
+    group.name = params['name'] || ''
+    apply_layer(group, params['layer'])
+
+    model.commit_operation
+    { id: group.entityID, name: group.name }
+  end
+
+  def self.handle_create_box(params = {})
+    x = params['width'].to_f
+    y = params['depth'].to_f
+    z = params['height'].to_f
+    origin = params['origin'] ? parse_point(params['origin']) : ORIGIN
+
+    model.start_operation('MCP Create Box', true)
+    pts = [
+      origin,
+      origin.offset(X_AXIS, x),
+      origin.offset(X_AXIS, x).offset(Y_AXIS, y),
+      origin.offset(Y_AXIS, y)
+    ]
+    face = entities.add_face(pts)
+    face.pushpull(z)
+    apply_layer(face, params['layer'])
+    apply_material(face, params['material'])
+    model.commit_operation
+    { status: 'created', width: x, depth: y, height: z }
+  end
+
+  def self.handle_create_component(params = {})
+    name = params['name'] || 'MCP Component'
+    model.start_operation('MCP Create Component', true)
+    defn = model.definitions.add(name)
+    defn.description = params['description'] || ''
+    pt = params['origin'] ? parse_point(params['origin']) : ORIGIN
+    transform = Geom::Transformation.new(pt)
+    instance = entities.add_instance(defn, transform)
+    model.commit_operation
+    { definition_name: defn.name, instance_id: instance.entityID }
+  end
+
+  def self.handle_place_component(params = {})
+    name = params['name'] || ''
+    defn = model.definitions.find { |d| d.name == name }
+    raise "Component definition not found: #{name}" unless defn
+    pt = params['origin'] ? parse_point(params['origin']) : ORIGIN
+    transform = Geom::Transformation.new(pt)
+    model.start_operation('MCP Place Component', true)
+    instance = entities.add_instance(defn, transform)
+    model.commit_operation
+    { instance_id: instance.entityID, definition: defn.name }
+  end
+
+  # --- Advanced geometry ---
+
+  def self.handle_create_circle(params = {})
+    center = params['center'] ? parse_point(params['center']) : ORIGIN
+    normal = params['normal'] ? parse_point(params['normal']) : Z_AXIS
+    radius = params['radius'].to_f
+    segments = params['segments'] ? params['segments'].to_i : 24
+
+    raise "Radius must be positive" if radius <= 0
+    raise "Segments must be at least 3" if segments < 3
+
+    model.start_operation('MCP Create Circle', true)
+    circle = entities.add_circle(center, normal, radius, segments)
+
+    # Apply layer/material to all edges
+    if params['layer'] || params['material']
+      circle.each do |edge|
+        apply_layer(edge, params['layer'])
+        apply_material(edge, params['material']) if edge.respond_to?(:material=)
+      end
+    end
+
+    model.commit_operation
+    {
+      status: 'created',
+      edge_count: circle.length,
+      center: vec3(center),
+      radius: radius,
+      segments: segments
+    }
+  end
+
+  def self.handle_create_arc(params = {})
+    center = params['center'] ? parse_point(params['center']) : ORIGIN
+    xaxis = params['xaxis'] ? parse_point(params['xaxis']) : X_AXIS
+    normal = params['normal'] ? parse_point(params['normal']) : Z_AXIS
+    radius = params['radius'].to_f
+    start_angle = params['start_angle'] ? params['start_angle'].to_f : 0.0
+    end_angle = params['end_angle'] ? params['end_angle'].to_f : 180.0
+    segments = params['segments'] ? params['segments'].to_i : 12
+
+    raise "Radius must be positive" if radius <= 0
+    raise "Segments must be at least 2" if segments < 2
+
+    model.start_operation('MCP Create Arc', true)
+    arc = entities.add_arc(center, xaxis, normal, radius, start_angle.degrees, end_angle.degrees, segments)
+
+    if params['layer'] || params['material']
+      arc.each do |edge|
+        apply_layer(edge, params['layer'])
+        apply_material(edge, params['material']) if edge.respond_to?(:material=)
+      end
+    end
+
+    model.commit_operation
+    {
+      status: 'created',
+      edge_count: arc.length,
+      center: vec3(center),
+      radius: radius,
+      start_angle: start_angle,
+      end_angle: end_angle
+    }
+  end
+
+  def self.handle_create_polygon(params = {})
+    center = params['center'] ? parse_point(params['center']) : ORIGIN
+    normal = params['normal'] ? parse_point(params['normal']) : Z_AXIS
+    radius = params['radius'].to_f
+    num_sides = params['num_sides'].to_i
+    inscribed = params['inscribed'].nil? ? true : params['inscribed']
+
+    raise "Radius must be positive" if radius <= 0
+    raise "Polygon must have at least 3 sides" if num_sides < 3
+
+    model.start_operation('MCP Create Polygon', true)
+
+    # add_ngon creates edges, we want to create a face
+    edges = entities.add_ngon(center, normal, radius, num_sides, inscribed)
+
+    # Try to create a face from the edges
+    face = nil
+    if edges.length >= 3
+      points = edges.map { |e| e.start.position }
+      face = entities.add_face(points) rescue nil
+    end
+
+    if params['layer'] || params['material']
+      edges.each do |edge|
+        apply_layer(edge, params['layer'])
+      end
+      if face
+        apply_layer(face, params['layer'])
+        apply_material(face, params['material'])
+      end
+    end
+
+    model.commit_operation
+    {
+      status: 'created',
+      edge_count: edges.length,
+      face_id: face ? face.entityID : nil,
+      center: vec3(center),
+      radius: radius,
+      num_sides: num_sides
+    }
+  end
+
+  def self.handle_push_pull(params = {})
+    entity_id = params['entity_id']
+    distance = params['distance'].to_f
+
+    raise "entity_id is required" unless entity_id
+
+    entity = find_entity_by_id(entity_id)
+    raise "Entity not found: #{entity_id}" unless entity
+    raise "Entity must be a Face" unless entity.is_a?(Sketchup::Face)
+
+    model.start_operation('MCP Push Pull', true)
+    result = entity.pushpull(distance)
+    model.commit_operation
+
+    {
+      status: 'completed',
+      entity_id: entity_id,
+      distance: distance,
+      result_valid: !result.nil?
+    }
+  end
+
+  def self.handle_follow_me(params = {})
+    face_id = params['face_id']
+    path_ids = params['path_ids']
+
+    raise "face_id is required" unless face_id
+    raise "path_ids array is required" unless path_ids && path_ids.is_a?(Array)
+
+    face = find_entity_by_id(face_id)
+    raise "Face not found: #{face_id}" unless face
+    raise "Entity must be a Face" unless face.is_a?(Sketchup::Face)
+
+    path_edges = path_ids.map do |id|
+      edge = find_entity_by_id(id)
+      raise "Edge not found: #{id}" unless edge
+      raise "Entity #{id} must be an Edge" unless edge.is_a?(Sketchup::Edge)
+      edge
+    end
+
+    model.start_operation('MCP Follow Me', true)
+    face.followme(path_edges)
+    model.commit_operation
+
+    {
+      status: 'completed',
+      face_id: face_id,
+      path_edge_count: path_edges.length
+    }
+  end
+
+  # --- Transformations ---
+
+  def self.handle_move_entity(params = {})
+    entity_id = params['entity_id']
+    vector = params['vector']
+
+    raise "entity_id is required" unless entity_id
+    raise "vector [x, y, z] is required" unless vector && vector.is_a?(Array) && vector.length == 3
+
+    entity = find_entity_by_id(entity_id)
+    raise "Entity not found: #{entity_id}" unless entity
+    raise "Entity cannot be transformed" unless entity.respond_to?(:transform!)
+
+    vec = Geom::Vector3d.new(vector[0].to_f, vector[1].to_f, vector[2].to_f)
+    transform = Geom::Transformation.translation(vec)
+
+    model.start_operation('MCP Move Entity', true)
+    entity.transform!(transform)
+    model.commit_operation
+
+    {
+      status: 'moved',
+      entity_id: entity_id,
+      vector: vec3(vec)
+    }
+  end
+
+  def self.handle_rotate_entity(params = {})
+    entity_id = params['entity_id']
+    axis_point = params['axis_point']
+    axis_vector = params['axis_vector']
+    angle = params['angle'].to_f
+
+    raise "entity_id is required" unless entity_id
+    raise "axis_point [x, y, z] is required" unless axis_point
+    raise "axis_vector [x, y, z] is required" unless axis_vector
+
+    entity = find_entity_by_id(entity_id)
+    raise "Entity not found: #{entity_id}" unless entity
+    raise "Entity cannot be transformed" unless entity.respond_to?(:transform!)
+
+    point = parse_point(axis_point)
+    vector = Geom::Vector3d.new(axis_vector[0].to_f, axis_vector[1].to_f, axis_vector[2].to_f)
+    transform = Geom::Transformation.rotation(point, vector, angle.degrees)
+
+    model.start_operation('MCP Rotate Entity', true)
+    entity.transform!(transform)
+    model.commit_operation
+
+    {
+      status: 'rotated',
+      entity_id: entity_id,
+      angle_degrees: angle
+    }
+  end
+
+  def self.handle_scale_entity(params = {})
+    entity_id = params['entity_id']
+    scale = params['scale']
+    origin = params['origin'] ? parse_point(params['origin']) : ORIGIN
+
+    raise "entity_id is required" unless entity_id
+
+    entity = find_entity_by_id(entity_id)
+    raise "Entity not found: #{entity_id}" unless entity
+    raise "Entity cannot be transformed" unless entity.respond_to?(:transform!)
+
+    transform = nil
+    if scale.is_a?(Array) && scale.length == 3
+      # Non-uniform scaling
+      transform = Geom::Transformation.scaling(origin, scale[0].to_f, scale[1].to_f, scale[2].to_f)
+      scale_info = { x: scale[0].to_f, y: scale[1].to_f, z: scale[2].to_f }
+    else
+      # Uniform scaling
+      s = scale.to_f
+      transform = Geom::Transformation.scaling(origin, s, s, s)
+      scale_info = { uniform: s }
+    end
+
+    model.start_operation('MCP Scale Entity', true)
+    entity.transform!(transform)
+    model.commit_operation
+
+    {
+      status: 'scaled',
+      entity_id: entity_id,
+      scale: scale_info
+    }
+  end
+
+  # --- Execute arbitrary Ruby ---
+
+  def self.handle_execute_ruby(params = {})
+    code = params['code'] || ''
+    raise "No code provided" if code.strip.empty?
+
+    result = nil
+    output = []
+
+    # Capture puts/print output
+    old_stdout = $stdout
+    $stdout = ::StringIO.new
+
+    op_open = false
+    begin
+      # One undo step: Edit > Undo (Ctrl+Z) reverts everything this call did.
+      model.start_operation(params['operation_name'] || 'MCP Ruby', true)
+      op_open = true
+      result = eval(code, binding) # rubocop:disable Security/Eval
+      model.commit_operation
+      op_open = false
+      output = $stdout.string.split("\n")
+    rescue Exception => e # rubocop:disable Lint/RescueException
+      model.abort_operation if op_open
+      op_open = false
+      output = $stdout.string.split("\n")
+      raise e
+    ensure
+      $stdout = old_stdout
+    end
+    output = output.first(500)
+
+    res = result.inspect
+    {
+      result: res.length > 20_000 ? res[0, 20_000] + '…(truncated)' : res,
+      output: output
+    }
+  rescue Exception => e # rubocop:disable Lint/RescueException
+    { error: e.message, backtrace: e.backtrace.first(5) }
+  end
+
+  # ---------------------------------------------------------------------------
+  # Internal helpers
+  # ---------------------------------------------------------------------------
+
+  def self.parse_point(arr)
+    Geom::Point3d.new(arr[0].to_f, arr[1].to_f, arr[2].to_f)
+  end
+
+  def self.parse_points(arr)
+    arr.map { |p| parse_point(p) }
+  end
+
+  def self.vec3(v)
+    { x: v.x, y: v.y, z: v.z }
+  end
+
+  def self.find_group(name)
+    entities.find { |e| e.is_a?(Sketchup::Group) && e.name == name }
+  end
+
+  def self.find_entity_by_id(entity_id)
+    id = entity_id.to_i
+    entities.find { |e| e.entityID == id }
+  end
+
+  def self.apply_layer(entity, layer_name)
+    return unless layer_name
+    layer = model.layers[layer_name] || model.layers.add(layer_name)
+    entity.layer = layer
+  end
+
+  def self.apply_material(entity, mat_name)
+    return unless mat_name
+    mat = model.materials[mat_name] || model.materials.add(mat_name)
+    entity.material = mat if entity.respond_to?(:material=)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Construction - Delegated to separate modules in lib/construction/
+  # ---------------------------------------------------------------------------
+
+  # Old truss helper methods have been moved to Construction::RoofTruss module
+
+
+  # Main roof truss handler - uses Medeek if available, falls back to built-in
+  def self.handle_create_roof_truss(params = {})
+    if Construction::MedeekTruss.available?
+      begin
+        result = Construction::MedeekTruss.create(params)
+        # If Medeek succeeded, return its result
+        if result && result[:status] == 'created'
+          return result
+        else
+          # Medeek failed to create trusses
+          error_msg = "Medeek Truss Plugin failed to create trusses. This may be due to invalid parameters or license issues. Using built-in implementation as fallback."
+          log "[SU_MCP] #{error_msg}"
+          built_in_result = Construction::RoofTruss.create(params)
+          built_in_result[:warning] = error_msg
+          built_in_result[:engine] = 'built-in (medeek failed)'
+          return built_in_result
+        end
+      rescue => e
+        error_msg = "Medeek Truss Plugin error: #{e.message}. Using built-in implementation as fallback."
+        log "[SU_MCP] #{error_msg}"
+        built_in_result = Construction::RoofTruss.create(params)
+        built_in_result[:warning] = error_msg
+        built_in_result[:engine] = 'built-in (medeek error)'
+        return built_in_result
+      end
+    else
+      # Medeek not installed
+      log "[SU_MCP] Medeek Truss Plugin not detected, using built-in implementation"
+      built_in_result = Construction::RoofTruss.create(params)
+      built_in_result[:info] = "Using built-in truss implementation. Install Medeek Truss Plugin for professional-grade trusses with more types and features."
+      built_in_result[:engine] = 'built-in (medeek not installed)'
+      return built_in_result
+    end
+  end
+
+  def self.handle_read_truss_attributes(params = {})
+    Construction::MedeekTruss.read_truss_attributes(params)
+  end
+
+  def self.handle_read_truss_attribute(params = {})
+    Construction::MedeekTruss.read_truss_attribute(params)
+  end
+
+  def self.handle_modify_truss_attribute(params = {})
+    Construction::MedeekTruss.modify_truss_attribute(params)
+  end
+
+  # Batch modify truss handler - modifies multiple attributes at once
+  def self.handle_modify_truss(params = {})
+    Construction::MedeekTruss.modify_truss(params)
+  end
+
+  # Wall handler - delegates to Construction::Wall module
+  def self.handle_create_wall(params = {})
+    Construction::Wall.create(params)
+  end
+
+  # Foundation handler - uses Medeek if available
+  def self.handle_create_foundation(params = {})
+    if Construction::MedeekFoundation.available?
+      begin
+        result = Construction::MedeekFoundation.create(params)
+        # If Medeek succeeded, return its result
+        if result && result[:status] == 'created'
+          return result
+        else
+          # Medeek failed to create foundation
+          error_msg = "Medeek Foundation Plugin failed to create foundation. This may be due to invalid parameters or license issues."
+          log "[SU_MCP] #{error_msg}"
+          return {
+            status: 'failed',
+            engine: 'none',
+            message: error_msg
+          }
+        end
+      rescue => e
+        error_msg = "Medeek Foundation Plugin error: #{e.message}"
+        log "[SU_MCP] #{error_msg}"
+        return {
+          status: 'failed',
+          engine: 'medeek (error)',
+          message: error_msg
+        }
+      end
+    else
+      # Medeek not installed
+      log "[SU_MCP] Medeek Foundation Plugin not detected"
+      return {
+        status: 'failed',
+        engine: 'none',
+        message: "Medeek Foundation Plugin not installed. Please install from SketchUp Extension Warehouse for foundation creation."
+      }
+    end
+  end
+
+  # Foundation reader handlers
+  def self.handle_read_foundation_attributes(params = {})
+    Construction::MedeekFoundationReader.read_all_attributes(params)
+  end
+
+  def self.handle_read_foundation_attribute(params = {})
+    Construction::MedeekFoundationReader.read_attribute(params)
+  end
+
+  # Foundation modifier handler
+  def self.handle_modify_foundation(params = {})
+    if Construction::MedeekFoundation.available?
+      begin
+        result = Construction::MedeekFoundation.modify(params)
+        # If Medeek succeeded, return its result
+        if result && result[:status] == 'modified'
+          return result
+        else
+          # Medeek failed to modify foundation
+          error_msg = "Medeek Foundation Plugin failed to modify foundation. #{result[:message] if result}"
+          log "[SU_MCP] #{error_msg}"
+          return {
+            status: 'failed',
+            engine: 'none',
+            message: error_msg
+          }
+        end
+      rescue => e
+        error_msg = "Medeek Foundation Plugin error: #{e.message}"
+        log "[SU_MCP] #{error_msg}"
+        return {
+          status: 'failed',
+          engine: 'medeek (error)',
+          message: error_msg
+        }
+      end
+    else
+      # Medeek not installed
+      log "[SU_MCP] Medeek Foundation Plugin not detected"
+      return {
+        status: 'failed',
+        engine: 'none',
+        message: "Medeek Foundation Plugin not installed. Please install from SketchUp Extension Warehouse."
+      }
+    end
+  end
+
+  def self.handle_get_foundation_info(params = {})
+    begin
+      result = Construction::MedeekFoundation.get_info(params)
+      return result
+    rescue => e
+      error_msg = "Failed to get foundation info: #{e.message}"
+      log "[SU_MCP] #{error_msg}"
+      return {
+        status: 'failed',
+        message: error_msg
+      }
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Wall handlers (Medeek Wall Plugin)
+  # ---------------------------------------------------------------------------
+
+  # Helper: Automatically detect foundation and adjust wall Z coordinates
+  def self.auto_adjust_wall_z_for_foundation(params)
+    begin
+      # Try to get foundation info
+      foundation_info = Construction::MedeekFoundation.get_info({})
+
+      if foundation_info && foundation_info[:status] == 'success'
+        slab_top_z = foundation_info[:slab_top_z]
+        log "[SU_MCP] Auto-detected foundation: slab_top_z = #{slab_top_z}\""
+
+        # Adjust start_point and end_point Z coordinates if present
+        if params['start_point'] && params['start_point'].is_a?(Array) && params['start_point'].length == 3
+          params['start_point'][2] = slab_top_z
+          log "[SU_MCP] Adjusted start_point Z to #{slab_top_z}\""
+        end
+
+        if params['end_point'] && params['end_point'].is_a?(Array) && params['end_point'].length == 3
+          params['end_point'][2] = slab_top_z
+          log "[SU_MCP] Adjusted end_point Z to #{slab_top_z}\""
+        end
+
+        # Adjust outline_points Z coordinates if present
+        if params['outline_points'] && params['outline_points'].is_a?(Array)
+          params['outline_points'].each do |pt|
+            if pt.is_a?(Array) && pt.length == 3
+              pt[2] = slab_top_z
+            end
+          end
+          log "[SU_MCP] Adjusted #{params['outline_points'].length} outline points Z to #{slab_top_z}\""
+        end
+      end
+    rescue => e
+      # Foundation not found or error - just continue with original params
+      log "[SU_MCP] No foundation auto-detected: #{e.message}"
+    end
+
+    params
+  end
+
+  def self.handle_create_medeek_wall(params = {})
+    if Construction::MedeekWall.available?
+      begin
+        # Auto-detect foundation and adjust Z coordinates if needed
+        params = auto_adjust_wall_z_for_foundation(params)
+
+        result = Construction::MedeekWall.create_wall(params)
+        if result && result[:status] == 'created'
+          return result
+        else
+          error_msg = "Medeek Wall Plugin failed to create wall. This may be due to invalid parameters or license issues."
+          log "[SU_MCP] #{error_msg}"
+          return { status: 'failed', engine: 'none', message: error_msg }
+        end
+      rescue => e
+        error_msg = "Medeek Wall Plugin error: #{e.message}"
+        log "[SU_MCP] #{error_msg}"
+        return { status: 'failed', engine: 'medeek (error)', message: error_msg }
+      end
+    else
+      log "[SU_MCP] Medeek Wall Plugin not detected"
+      return {
+        status: 'failed',
+        engine: 'none',
+        message: "Medeek Wall Plugin not installed. Please install from SketchUp Extension Warehouse for wall creation."
+      }
+    end
+  end
+
+  def self.handle_create_wall_perimeter(params = {})
+    if Construction::MedeekWall.available?
+      begin
+        # Auto-detect foundation and adjust Z coordinates if needed
+        params = auto_adjust_wall_z_for_foundation(params)
+
+        result = Construction::MedeekWall.create_wall_perimeter(params)
+        if result && result[:status] == 'created'
+          return result
+        else
+          error_msg = "Medeek Wall Plugin failed to create wall perimeter. #{result[:message] if result}"
+          log "[SU_MCP] #{error_msg}"
+          return { status: 'failed', engine: 'none', message: error_msg }
+        end
+      rescue => e
+        error_msg = "Medeek Wall Plugin error: #{e.message}"
+        log "[SU_MCP] #{error_msg}"
+        return { status: 'failed', engine: 'medeek (error)', message: error_msg }
+      end
+    else
+      log "[SU_MCP] Medeek Wall Plugin not detected"
+      return {
+        status: 'failed',
+        engine: 'none',
+        message: "Medeek Wall Plugin not installed."
+      }
+    end
+  end
+
+  def self.handle_read_wall_attributes(params = {})
+    Construction::MedeekWall.read_wall_attributes(params)
+  end
+
+  def self.handle_read_wall_attribute(params = {})
+    Construction::MedeekWall.read_wall_attribute(params)
+  end
+
+  def self.handle_modify_wall_attribute(params = {})
+    if Construction::MedeekWall.available?
+      begin
+        result = Construction::MedeekWall.modify_wall_attribute(params)
+        if result && result[:status] == 'modified'
+          return result
+        else
+          error_msg = "Medeek Wall Plugin failed to modify wall attribute. #{result[:message] if result}"
+          log "[SU_MCP] #{error_msg}"
+          return { status: 'failed', engine: 'none', message: error_msg }
+        end
+      rescue => e
+        error_msg = "Medeek Wall Plugin error: #{e.message}"
+        log "[SU_MCP] #{error_msg}"
+        return { status: 'failed', engine: 'medeek (error)', message: error_msg }
+      end
+    else
+      log "[SU_MCP] Medeek Wall Plugin not detected"
+      return {
+        status: 'failed',
+        engine: 'none',
+        message: "Medeek Wall Plugin not installed."
+      }
+    end
+  end
+
+  def self.handle_add_window(params = {})
+    if Construction::MedeekWall.available?
+      begin
+        result = Construction::MedeekWall.add_window(params)
+        if result && result[:status] == 'created'
+          return result
+        else
+          error_msg = "Medeek Wall Plugin failed to add window. #{result[:message] if result}"
+          log "[SU_MCP] #{error_msg}"
+          return { status: 'failed', engine: 'none', message: error_msg }
+        end
+      rescue => e
+        error_msg = "Medeek Wall Plugin error: #{e.message}"
+        log "[SU_MCP] #{error_msg}"
+        return { status: 'failed', engine: 'medeek (error)', message: error_msg }
+      end
+    else
+      log "[SU_MCP] Medeek Wall Plugin not detected"
+      return {
+        status: 'failed',
+        engine: 'none',
+        message: "Medeek Wall Plugin not installed."
+      }
+    end
+  end
+
+  def self.handle_read_window_attributes(params = {})
+    Construction::MedeekWall.read_window_attributes(params)
+  end
+
+  def self.handle_add_door(params = {})
+    if Construction::MedeekWall.available?
+      begin
+        result = Construction::MedeekWall.add_door(params)
+        if result && result[:status] == 'created'
+          return result
+        else
+          error_msg = "Medeek Wall Plugin failed to add door. #{result[:message] if result}"
+          log "[SU_MCP] #{error_msg}"
+          return { status: 'failed', engine: 'none', message: error_msg }
+        end
+      rescue => e
+        error_msg = "Medeek Wall Plugin error: #{e.message}"
+        log "[SU_MCP] #{error_msg}"
+        return { status: 'failed', engine: 'medeek (error)', message: error_msg }
+      end
+    else
+      log "[SU_MCP] Medeek Wall Plugin not detected"
+      return {
+        status: 'failed',
+        engine: 'none',
+        message: "Medeek Wall Plugin not installed."
+      }
+    end
+  end
+
+  def self.handle_read_door_attributes(params = {})
+    Construction::MedeekWall.read_door_attributes(params)
+  end
+
+  def self.handle_add_garage_door(params = {})
+    if Construction::MedeekWall.available?
+      begin
+        result = Construction::MedeekWall.add_garage_door(params)
+        if result && result[:status] == 'created'
+          return result
+        else
+          error_msg = "Medeek Wall Plugin failed to add garage door. #{result[:message] if result}"
+          log "[SU_MCP] #{error_msg}"
+          return { status: 'failed', engine: 'none', message: error_msg }
+        end
+      rescue => e
+        error_msg = "Medeek Wall Plugin error: #{e.message}"
+        log "[SU_MCP] #{error_msg}"
+        return { status: 'failed', engine: 'medeek (error)', message: error_msg }
+      end
+    else
+      log "[SU_MCP] Medeek Wall Plugin not detected"
+      return {
+        status: 'failed',
+        engine: 'none',
+        message: "Medeek Wall Plugin not installed."
+      }
+    end
+  end
+
+  def self.handle_read_garage_attributes(params = {})
+    Construction::MedeekWall.read_garage_attributes(params)
+  end
+
+  def self.handle_add_column(params = {})
+    if Construction::MedeekWall.available?
+      begin
+        result = Construction::MedeekWall.add_column(params)
+        if result && result[:status] == 'created'
+          return result
+        else
+          error_msg = "Medeek Wall Plugin failed to add column. #{result[:message] if result}"
+          log "[SU_MCP] #{error_msg}"
+          return { status: 'failed', engine: 'none', message: error_msg }
+        end
+      rescue => e
+        error_msg = "Medeek Wall Plugin error: #{e.message}"
+        log "[SU_MCP] #{error_msg}"
+        return { status: 'failed', engine: 'medeek (error)', message: error_msg }
+      end
+    else
+      log "[SU_MCP] Medeek Wall Plugin not detected"
+      return {
+        status: 'failed',
+        engine: 'none',
+        message: "Medeek Wall Plugin not installed."
+      }
+    end
+  end
+
+  def self.handle_read_column_attributes(params = {})
+    Construction::MedeekWall.read_column_attributes(params)
+  end
+
+  def self.handle_get_wall_info(params = {})
+    Construction::MedeekWall.get_wall_info(params)
+  end
+
+  # ---------------------------------------------------------------------------
+  # HTTP Server (using TCPServer instead of WEBrick for Ruby 3.2+)
+  # ---------------------------------------------------------------------------
+
+  ROUTES = {
+    # GET
+    ['GET',  '/model/info']        => :handle_get_model_info,
+    ['GET',  '/model/layers']      => :handle_list_layers,
+    ['GET',  '/model/materials']   => :handle_list_materials,
+    ['GET',  '/model/entities']    => :handle_list_entities,
+    ['GET',  '/model/components']  => :handle_list_components,
+    # POST - Basic geometry
+    ['POST', '/geometry/face']     => :handle_create_face,
+    ['POST', '/geometry/edge']     => :handle_create_edge,
+    ['POST', '/geometry/group']    => :handle_create_group,
+    ['POST', '/geometry/box']      => :handle_create_box,
+    # POST - Advanced geometry
+    ['POST', '/geometry/circle']   => :handle_create_circle,
+    ['POST', '/geometry/arc']      => :handle_create_arc,
+    ['POST', '/geometry/polygon']  => :handle_create_polygon,
+    ['POST', '/geometry/pushpull'] => :handle_push_pull,
+    ['POST', '/geometry/followme'] => :handle_follow_me,
+    # POST - Transformations
+    ['POST', '/transform/move']    => :handle_move_entity,
+    ['POST', '/transform/rotate']  => :handle_rotate_entity,
+    ['POST', '/transform/scale']   => :handle_scale_entity,
+    # POST - Components
+    ['POST', '/components/create'] => :handle_create_component,
+    ['POST', '/components/place']  => :handle_place_component,
+    # POST - Construction
+    ['POST', '/construction/roof_truss']  => :handle_create_roof_truss,
+    ['POST', '/construction/truss/read_attributes'] => :handle_read_truss_attributes,
+    ['POST', '/construction/truss/read_attribute']  => :handle_read_truss_attribute,
+    ['POST', '/construction/truss/modify']          => :handle_modify_truss_attribute,
+    ['POST', '/construction/truss/modify_batch']    => :handle_modify_truss,
+    ['POST', '/construction/wall']        => :handle_create_wall,
+    ['POST', '/construction/foundation']  => :handle_create_foundation,
+    ['POST', '/construction/foundation/read_attributes'] => :handle_read_foundation_attributes,
+    ['POST', '/construction/foundation/read_attribute']  => :handle_read_foundation_attribute,
+    ['POST', '/construction/foundation/modify']          => :handle_modify_foundation,
+    ['POST', '/construction/foundation/info']            => :handle_get_foundation_info,
+    ['POST', '/construction/wall/create']                => :handle_create_medeek_wall,
+    ['POST', '/construction/wall/perimeter']             => :handle_create_wall_perimeter,
+    ['POST', '/construction/wall/read_attributes']       => :handle_read_wall_attributes,
+    ['POST', '/construction/wall/read_attribute']        => :handle_read_wall_attribute,
+    ['POST', '/construction/wall/modify']                => :handle_modify_wall_attribute,
+    ['POST', '/construction/wall/window']                => :handle_add_window,
+    ['POST', '/construction/wall/window/read_attributes'] => :handle_read_window_attributes,
+    ['POST', '/construction/wall/door']                  => :handle_add_door,
+    ['POST', '/construction/wall/door/read_attributes']  => :handle_read_door_attributes,
+    ['POST', '/construction/wall/garage']                => :handle_add_garage_door,
+    ['POST', '/construction/wall/garage/read_attributes'] => :handle_read_garage_attributes,
+    ['POST', '/construction/wall/column']                => :handle_add_column,
+    ['POST', '/construction/wall/column/read_attributes'] => :handle_read_column_attributes,
+    ['POST', '/construction/wall/info']                  => :handle_get_wall_info,
+    # POST - Ruby
+    ['POST', '/ruby/execute']      => :handle_execute_ruby,
+    # Inspection / view (sketchup_mcp/inspect.rb)
+    ['GET',  '/inspect/summary']    => :handle_inspect_summary,
+    ['POST', '/inspect/outline']    => :handle_inspect_outline,
+    ['GET',  '/inspect/scenes']     => :handle_inspect_scenes,
+    ['GET',  '/inspect/tags']       => :handle_inspect_tags,
+    ['GET',  '/inspect/materials']  => :handle_inspect_materials,
+    ['GET',  '/inspect/health']     => :handle_inspect_health,
+    ['POST', '/inspect/find']       => :handle_inspect_find,
+    ['POST', '/inspect/entity']     => :handle_inspect_entity,
+    ['GET',  '/inspect/selection']  => :handle_inspect_selection,
+    ['POST', '/view/select']        => :handle_view_select,
+    ['POST', '/view/capture']       => :handle_view_capture,
+    ['POST', '/model/save']         => :handle_model_save,
+  }
+
+  { inspect_summary: :summary, inspect_outline: :outline, inspect_scenes: :scenes,
+    inspect_tags: :tags, inspect_materials: :materials, inspect_health: :health,
+    inspect_find: :find, inspect_entity: :entity, inspect_selection: :selection,
+    view_select: :select, view_capture: :capture_view, model_save: :save }.each do |h, m|
+    define_singleton_method("handle_#{h}") { |params = {}| Inspect.public_send(m, params) }
+  end
+
+  def self.parse_http_request(request_text)
+    lines = request_text.split("\r\n")
+    request_line = lines[0]
+    method, path, _ = request_line.split(' ')
+
+    # Parse path and query string
+    uri = URI.parse(path)
+    query_params = uri.query ? CGI.parse(uri.query) : {}
+
+    # Find body (after blank line)
+    body_index = lines.index('')
+    header_lines = body_index ? lines[1...body_index] : lines[1..]
+    headers = {}
+    header_lines.to_a.each do |l|
+      k, v = l.split(':', 2)
+      headers[k.strip.downcase] = v.to_s.strip if v
+    end
+    body = body_index ? lines[(body_index + 1)..-1].join("\r\n") : ''
+    body = body.dup.force_encoding('UTF-8')
+
+    { method: method, path: uri.path, query: query_params, body: body, headers: headers }
+  end
+
+  def self.handle_request(request)
+    log "[SU_MCP] ===== Received HTTP request ====="
+
+    req = parse_http_request(request)
+    method = req[:method]
+    path = req[:path]
+
+    log "[SU_MCP] Parsed: #{method} #{path}"
+
+    # Reject anything that isn't addressed to the loopback host (guards against
+    # DNS-rebinding) or that doesn't carry the shared token.
+    host = req[:headers]['host'].to_s.sub(/:\d+\z/, '')
+    unless ['127.0.0.1', 'localhost', '[::1]'].include?(host)
+      return send_error_response("Forbidden host", 403)
+    end
+    supplied = req[:headers]['x-su-mcp-token'].to_s
+    unless supplied.bytesize == token.bytesize && supplied.bytes.zip(token.bytes).map { |a, b| a ^ b }.sum.zero?
+      return send_error_response("Missing or invalid X-SU-MCP-Token (see #{TOKEN_FILE})", 401)
+    end
+
+    handler = ROUTES[[method, path]]
+
+    unless handler
+      log "[SU_MCP] Unknown route: #{method} #{path}"
+      return send_error_response("Unknown route: #{method} #{path}", 404)
+    end
+
+    log "[SU_MCP] Handler: #{handler}"
+
+    # Parse parameters
+    params = {}
+    if method == 'POST' && !req[:body].empty?
+      begin
+        params = JSON.parse(req[:body])
+      rescue JSON::ParserError => e
+        return send_error_response("Invalid JSON: #{e.message}", 400)
+      end
+    elsif method == 'GET'
+      req[:query].each { |k, v| params[k] = v.first }
+    end
+
+    # Create request object for main thread execution
+    request_obj = {
+      handler: handler,
+      params: params,
+      response: nil,
+      error: nil,
+      completed: false
+    }
+
+    log "[SU_MCP] Enqueueing request: #{method} #{path}"
+
+    # Enqueue request for main thread processing
+    @queue_mutex.synchronize do
+      @request_queue << request_obj
+      @queue_cv.signal
+      log "[SU_MCP] Queue size: #{@request_queue.length}"
+    end
+
+    # Wait for completion with simple polling (no condition variable)
+    timeout_at = Time.now + REQUEST_TIMEOUT
+    until request_obj[:completed]
+      if Time.now > timeout_at
+        return send_error_response("Request timeout", 504)
+      end
+      sleep(0.001)  # 1ms sleep between checks
+    end
+
+    # Return response or error
+    if request_obj[:error]
+      send_error_response("#{request_obj[:error][:class]}: #{request_obj[:error][:message]}", 500)
+    else
+      send_json_response(request_obj[:response])
+    end
+
+  rescue => e
+    send_error_response("#{e.class}: #{e.message}", 500)
+  end
+
+  # Process queued requests on the main thread
+  def self.process_queue
+    # Get request without holding mutex during execution
+    request_obj = nil
+    @queue_mutex.synchronize do
+      return if @request_queue.empty?
+      request_obj = @request_queue.shift
+    end
+
+    return unless request_obj
+
+    log "[SU_MCP] Processing handler: #{request_obj[:handler]}"
+
+    begin
+      # Execute handler on main thread WITHOUT holding mutex
+      # This prevents deadlocks and allows HTTP thread to check status
+      result = public_send(request_obj[:handler], request_obj[:params])
+
+      # Update result (no mutex needed for simple assignment)
+      request_obj[:response] = result
+      request_obj[:completed] = true
+
+      log "[SU_MCP] Handler completed successfully"
+    rescue => e
+      log "[SU_MCP] Handler error: #{e.class}: #{e.message}"
+      log e.backtrace.first(5).join("\n")
+
+      # Update error (no mutex needed for simple assignment)
+      request_obj[:error] = { class: e.class.name, message: e.message }
+      request_obj[:completed] = true
+    end
+  rescue => e
+    log "[SU_MCP] CRITICAL ERROR in process_queue: #{e.class}: #{e.message}"
+    log e.backtrace.first(10).join("\n")
+  end
+
+  # Start/stop server
+  def self.start_server(show_message = false)
+    return if @server
+
+    begin
+      @server = TCPServer.new('127.0.0.1', PORT)
+      @running = true
+
+      @thread = Thread.new do
+        begin
+          while @running
+            begin
+              client = @server.accept
+              request = ''
+              start_time = Time.now
+
+              # Read request
+              while (line = client.gets) && line !~ /^\s*$/
+                request += line
+              end
+              read_time = Time.now
+
+              # Read body if present
+              if request =~ /Content-Length: (\d+)/i
+                content_length = $1.to_i
+                request += "\r\n" + client.read(content_length)
+              end
+
+              # Store timing
+              @last_request_timing = {
+                accept_to_read: ((read_time - start_time) * 1000).round(1),
+                request_size: request.length,
+                handle_start: Time.now
+              }
+
+              # Handle request
+              response = handle_request(request)
+              handle_time = Time.now
+
+              @last_request_timing[:handle_duration] = ((handle_time - @last_request_timing[:handle_start]) * 1000).round(1)
+
+              client.write(response)
+              write_time = Time.now
+
+              @last_request_timing[:write_duration] = ((write_time - handle_time) * 1000).round(1)
+              @last_request_timing[:total] = ((write_time - start_time) * 1000).round(1)
+
+              # Schedule main thread to log this
+              UI.start_timer(0) do
+                log "[SU_MCP] Request timing: read=#{@last_request_timing[:accept_to_read]}ms, handle=#{@last_request_timing[:handle_duration]}ms, write=#{@last_request_timing[:write_duration]}ms, TOTAL=#{@last_request_timing[:total]}ms"
+              end
+
+            rescue => e
+              UI.start_timer(0) { log "[SU_MCP] Request error: #{e.message}" }
+            ensure
+              client.close if client
+            end
+          end
+        rescue => e
+          UI.start_timer(0) { log "[SU_MCP] Server error: #{e.message}" }
+        end
+      end
+
+      # Start main thread timer to process queued requests
+      # Timer runs every 0.03 seconds (30ms) to check for pending requests
+      @timer_id = UI.start_timer(0.03, true) { SU_MCP.process_queue }
+      log "[SU_MCP] Main thread timer started (ID: #{@timer_id})"
+
+      token # make sure the token file exists before any client connects
+      UI.messagebox("SketchUp MCP Server started on port #{PORT}") if show_message
+      log "[SU_MCP] Server running on http://localhost:#{PORT}"
+      log "[SU_MCP] Logging to Ruby Console (Window → Ruby Console)"
+
+    rescue Errno::EADDRINUSE
+      error_msg = "Port #{PORT} is already in use. Another instance may be running.\n\n" \
+                  "Try:\n" \
+                  "1. Close other SketchUp windows\n" \
+                  "2. Windows: run 'netstat -ano | findstr :#{PORT}' to find the process\n" \
+                  "3. Change PORT in the plugin file if needed"
+
+      puts "[SU_MCP] ERROR: #{error_msg}"
+      UI.messagebox(error_msg, MB_OK) if defined?(UI)
+
+      @server = nil
+      @thread = nil
+    rescue => e
+      error_msg = "Failed to start server: #{e.class} - #{e.message}"
+      puts "[SU_MCP] ERROR: #{error_msg}"
+      UI.messagebox(error_msg, MB_OK) if defined?(UI)
+
+      @server = nil
+      @thread = nil
+    end
+  end
+
+  def self.stop_server
+    return unless @server
+
+    @running = false
+
+    # Stop the main thread timer
+    UI.stop_timer(@timer_id) if @timer_id
+    @timer_id = nil
+
+    @server.close
+    @thread&.join(2)
+    @server = nil
+    @thread = nil
+
+    puts "[SU_MCP] Server stopped"
+  end
+
+  def self.restart_server
+    stop_server
+    start_server
+  end
+
+  # ---------------------------------------------------------------------------
+  # SketchUp plugin registration
+  # ---------------------------------------------------------------------------
+  unless file_loaded?(__FILE__)
+    log "[SU_MCP] ===== Plugin loading ====="
+    log "[SU_MCP] Ruby version: #{RUBY_VERSION}"
+    log "[SU_MCP] SketchUp version: #{Sketchup.version}"
+
+    # Add menu items
+    menu = UI.menu('Plugins').add_submenu('MCP Server')
+    menu.add_item('Start Server')   { SU_MCP.start_server(true) }
+    menu.add_item('Stop Server')    { SU_MCP.stop_server }
+    menu.add_item('Restart Server') { SU_MCP.restart_server }
+    menu.add_item('Show Token File') { UI.messagebox("Token file:\n#{SU_MCP::TOKEN_FILE}") }
+
+    log "[SU_MCP] Menu items added"
+
+    # Auto-start when SketchUp loads
+    SU_MCP.start_server
+
+    file_loaded(__FILE__)
+    log "[SU_MCP] Plugin loaded successfully"
+  end
+end

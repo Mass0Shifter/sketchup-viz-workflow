@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "sketchup": {
+      "command": "C:\\Users\\USER\\Dev Projects\\sketchup-viz-workflow\\.venv\\Scripts\\sketchup-mcp.exe",
+      "args": [],
+      "env": {}
+    }
+  }
+}
