@@ -1100,7 +1100,7 @@ module SU_MCP
 
     # Find body (after blank line)
     body_index = lines.index('')
-    header_lines = body_index ? lines[1...body_index] : lines[1..]
+    header_lines = body_index ? lines[1...body_index] : lines[1..-1]
     headers = {}
     header_lines.to_a.each do |l|
       k, v = l.split(':', 2)

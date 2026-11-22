@@ -352,10 +352,9 @@ module SU_MCP
       m.definitions.each { |d| check.call(d.entities) unless d.image? }
 
       unused_defs = m.definitions.select { |d| !d.image? && !d.group? && d.instances.empty? }.map(&:name)
-      _, mat_use = usage_counts(WALK_LIMIT_DEFAULT)
+      tag_use, mat_use = usage_counts(WALK_LIMIT_DEFAULT)
       unused_mats = m.materials.select { |mt| mat_use[mt.name].zero? }.map(&:name)
-      tag_use, = usage_counts(WALK_LIMIT_DEFAULT)
-      unused_tags = m.layers.to_a[1..].to_a.select { |l| tag_use[l.name].zero? }.map(&:name)
+      unused_tags = m.layers.to_a[1..-1].to_a.select { |l| tag_use[l.name].zero? }.map(&:name)
 
       notes = []
       notes << "#{root_loose[:faces]} faces / #{root_loose[:edges]} edges sit loose at the top level (not grouped)" if (root_loose[:faces] + root_loose[:edges]).positive?
@@ -436,7 +435,12 @@ module SU_MCP
       dicts = e.attribute_dictionaries
       if dicts
         h[:attributes] = dicts.each_with_object({}) do |dict, acc|
-          acc[dict.name] = dict.first(40).to_h { |k, v| [k, v.is_a?(String) ? v[0, 200] : v.to_s[0, 200]] }
+          vals = {}
+          dict.each_pair do |k, v|
+            break if vals.length >= 40
+            vals[k] = v.is_a?(String) ? v[0, 200] : v.to_s[0, 200]
+          end
+          acc[dict.name] = vals
         end
       end
       h
@@ -453,8 +457,8 @@ module SU_MCP
       sel.clear
       found = pids.map { |p| model.find_entity_by_persistent_id(p) }.compact
       # Only entities in the active editing context can be selected.
-      ctx = model.active_entities
-      selectable = found.select { |e| e.parent.respond_to?(:entities) && e.parent.entities == ctx || e.parent == model && ctx == model.entities }
+      ctx_parent = model.active_entities.parent
+      selectable = found.select { |e| e.parent == ctx_parent }
       sel.add(selectable) unless selectable.empty?
       model.active_view.zoom(sel) if params['zoom'] && !sel.empty?
       { selected: sel.length, not_found: pids.length - found.length, not_in_active_context: found.length - selectable.length }
