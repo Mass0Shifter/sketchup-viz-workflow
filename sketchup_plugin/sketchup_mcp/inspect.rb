@@ -476,6 +476,53 @@ module SU_MCP
       'right'  => [1, 0, 0]
     }.freeze
 
+    # World-space placement of an entity: its parent transformation is found
+    # by walking the model from the root (first placement if a component is
+    # used more than once). Entity#bounds is in the parent's local space, so
+    # nested groups/components need this for camera framing.
+    def world_transform_of(target)
+      search = lambda do |ents, tr|
+        ents.each do |e|
+          return tr if e == target
+          next unless container?(e)
+          found = search.call(definition_of(e).entities, tr * e.transformation)
+          return found if found
+        end
+        nil
+      end
+      search.call(model.entities, Geom::Transformation.new) || Geom::Transformation.new
+    end
+
+    def world_bounds(e)
+      parent_tr = world_transform_of(e)
+      bb = Geom::BoundingBox.new
+      local = e.bounds
+      8.times { |i| bb.add(local.corner(i).transform(parent_tr)) }
+      bb
+    end
+
+    # Point the camera along `dir` at `bb` and fit it to the frame.
+    def frame_camera(bb, dir, up, persp, aspect)
+      center = bb.center
+      radius = [bb.diagonal / 2.0, 1].max
+      if persp
+        fov = 35.0
+        half = (fov / 2.0).degrees
+        half = Math.atan(Math.tan(half) * aspect) if aspect < 1 # horizontal limits on tall frames
+        dist = radius / Math.sin(half) * 1.05
+      else
+        dist = radius * 4
+      end
+      eye = center.offset(dir, dist)
+      cam = Sketchup::Camera.new(eye, center, up, persp)
+      if persp
+        cam.fov = 35
+      else
+        cam.height = radius * 2 * 1.05 / [aspect, 1.0].min
+      end
+      cam
+    end
+
     def copy_camera(c)
       cam = Sketchup::Camera.new(c.eye, c.target, c.up, c.perspective?)
       if c.perspective?
@@ -501,32 +548,33 @@ module SU_MCP
         view.camera = copy_camera(pg.camera) if pg.use_camera?
       end
 
+      width = (params['width'] || 1280).to_i.clamp(200, 3840)
+      height = (params['height'] || 800).to_i.clamp(200, 2160)
+      aspect = width.to_f / height
+
       vname = params['view'].to_s
       if VIEW_DIRS.key?(vname)
         target_ent = params['pid'] ? find_pid(params['pid']) : nil
-        bb = target_ent ? target_ent.bounds : m.bounds
-        center = bb.center
         dir = Geom::Vector3d.new(*VIEW_DIRS[vname]).normalize
-        dist = [bb.diagonal, 1].max * 2
-        eye = center.offset(dir, dist)
         up = %w[top bottom].include?(vname) ? Geom::Vector3d.new(0, 1, 0) : Geom::Vector3d.new(0, 0, 1)
         persp = vname == 'iso' ? (params.key?('perspective') ? params['perspective'] : true) : (params['perspective'] || false)
-        cam = Sketchup::Camera.new(eye, center, up, persp)
-        cam.fov = 35 if persp
-        view.camera = cam
         if target_ent
-          view.zoom(target_ent)
+          view.camera = frame_camera(world_bounds(target_ent), dir, up, persp, aspect)
         else
+          cam = Sketchup::Camera.new(m.bounds.center.offset(dir, [m.bounds.diagonal, 1].max * 2), m.bounds.center, up, persp)
+          cam.fov = 35 if persp
+          view.camera = cam
           view.zoom_extents
         end
       elsif params['pid']
-        view.zoom(find_pid(params['pid']))
+        c = view.camera
+        dir = c.eye - c.target
+        dir = Geom::Vector3d.new(-1, -1, 1) unless dir.valid?
+        view.camera = frame_camera(world_bounds(find_pid(params['pid'])), dir.normalize, c.up, c.perspective?, aspect)
       elsif params['zoom_extents']
         view.zoom_extents
       end
 
-      width = (params['width'] || 1280).to_i.clamp(200, 3840)
-      height = (params['height'] || 800).to_i.clamp(200, 2160)
       fmt = params['format'].to_s == 'png' ? 'png' : 'jpg'
       file = File.join(Sketchup.temp_dir, "su_mcp_capture_#{Process.pid}_#{(Time.now.to_f * 1000).to_i}.#{fmt}")
       opts = { filename: file, width: width, height: height, antialias: true }
